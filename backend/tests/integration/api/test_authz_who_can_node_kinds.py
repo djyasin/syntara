@@ -6,6 +6,8 @@ from uuid import UUID
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete
+from sqlmodel import col
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from syntara.authz.engine import AuthzRequest, authorize
@@ -49,6 +51,13 @@ class _RealEvaluator:
 
     def evaluate(self, authz_input: dict[str, Any]) -> dict[str, Any]:
         return evaluate_policy_input(authz_input)
+
+
+@pytest.fixture
+async def without_default_step_allow(test_db_session: AsyncSession) -> None:
+    """Simulate a missing baseline grant directly; the built-in assignment is API-protected."""
+    await test_db_session.exec(delete(RoleAssignment).where(col(RoleAssignment.role_name) == "step-author"))
+    await test_db_session.commit()
 
 
 @pytest.mark.asyncio
@@ -145,6 +154,7 @@ async def test_global_and_project_assignment_of_same_policy_are_distinct(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("without_default_step_allow")
 async def test_who_can_excludes_explicit_and_implicit_denials_and_keeps_pagination(
     admin_client: AsyncClient, test_db_session: AsyncSession, user_factory: Callable[..., Awaitable[User]]
 ) -> None:
@@ -199,6 +209,7 @@ async def test_who_can_keeps_existing_query_gate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("without_default_step_allow")
 async def test_missing_allow_is_reported_by_can_i(
     auth_client: AsyncClient,
 ) -> None:

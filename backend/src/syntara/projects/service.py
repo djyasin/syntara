@@ -1,7 +1,7 @@
 """Project service for business logic."""
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import structlog
@@ -10,11 +10,15 @@ from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from syntara.authz.engine import AllowedProjectsResult, assign_authenticated_group_project_user, assign_project_admin
+from syntara.authz.evaluator import AuthzEvaluator
 from syntara.authz.models.assignments import RoleAssignment
 from syntara.authz.models.project import Project
 from syntara.core.models import User
 from syntara.core.services import BaseService
 from syntara.projects.schemas import ProjectListResponse
+
+if TYPE_CHECKING:
+    from syntara.workflows.models.workflow import Workflow
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -22,9 +26,10 @@ logger = structlog.stdlib.get_logger(__name__)
 class ProjectService(BaseService):
     """Service for project CRUD and role management."""
 
-    def __init__(self, session: AsyncSession, user: User) -> None:
+    def __init__(self, session: AsyncSession, user: User, opa_client: AuthzEvaluator | None = None) -> None:
         """Initialize with database session and current user."""
         super().__init__(session, user)
+        self.opa_client = opa_client
 
     async def create_project(
         self,
@@ -205,6 +210,8 @@ class ProjectService(BaseService):
 
         """
         project = await self.get_project(project_id)
+        # Block new child inserts while the contained workflows are checked and deleted.
+        await self.session.refresh(project, with_for_update=True)
         if project.is_builtin:
             from syntara.authz.exceptions import BuiltinProtectionError  # noqa: PLC0415
 
@@ -288,6 +295,34 @@ class ProjectService(BaseService):
 
         raise ProjectCredentialInUseError(project_name, credential_names, integration_names, total_count)
 
+    async def _check_workflow_step_types(self, workflows: list["Workflow"], project_id: UUID) -> None:
+        """Authorize all latest drafts before any project cleanup or external side effect."""
+        from syntara.workflows.exceptions import WorkflowVersionNotFoundError  # noqa: PLC0415
+        from syntara.workflows.models.workflow import Workflow  # noqa: PLC0415
+        from syntara.workflows.models.workflow_version import WorkflowVersion  # noqa: PLC0415
+        from syntara.workflows.node_permissions import check_node_kind_write_permission  # noqa: PLC0415
+
+        if not workflows:
+            return
+        versions_result = await self.session.exec(
+            select(WorkflowVersion)
+            .join(Workflow, col(Workflow.id) == WorkflowVersion.workflow_id)
+            .where(Workflow.project_id == project_id, WorkflowVersion.version == Workflow.current_version)
+        )
+        versions = {v.workflow_id: v for v in versions_result.all()}
+        for workflow in workflows:
+            if workflow.id not in versions:
+                raise WorkflowVersionNotFoundError(workflow.id, workflow.current_version)
+        await check_node_kind_write_permission(
+            self.session,
+            self.opa_client,
+            self.user,
+            [v.workflow_definition for v in versions.values()],
+            project_id=project_id,
+            operation="delete project",
+            resource_id=str(project_id),
+        )
+
     async def _cascade_cleanup_project_resources(self, project_id: UUID) -> None:
         """Delete all project-scoped resources before hard-deleting the project.
 
@@ -295,7 +330,6 @@ class ProjectService(BaseService):
         External side-effects (Temporal schedules, file storage) are best-effort.
         """
         from sqlalchemy import func as sa_func  # noqa: PLC0415
-        from sqlmodel import col  # noqa: PLC0415
 
         from syntara.agent_orchestrator.models.invocation import Invocation  # noqa: PLC0415
         from syntara.approvals.models.approval_request import ApprovalRequest  # noqa: PLC0415
@@ -320,6 +354,8 @@ class ProjectService(BaseService):
         result = await self.session.exec(select(Workflow).where(Workflow.project_id == project_id).with_for_update())
         locked_workflows = list(result.all())
         locked_wf_ids = [w.id for w in locked_workflows]
+
+        await self._check_workflow_step_types(locked_workflows, project_id)
 
         if locked_wf_ids:
             non_terminal_count = await self.session.scalar(

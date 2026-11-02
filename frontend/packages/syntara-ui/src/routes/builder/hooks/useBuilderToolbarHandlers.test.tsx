@@ -773,4 +773,18 @@ describe('useBuilderToolbarHandlers', () => {
     })
     expect(dispatch).toHaveBeenCalledWith({ type: 'SET_DELETE_DIALOG', payload: false })
   })
+
+  it('shows blocked step types when workflow deletion is denied', () => {
+    const detail = "You can't delete workflow: Script (write denied)."
+    const deleteWorkflow = vi.fn((...args: Parameters<DeleteWorkflow>) => {
+      args[1]?.onError?.({ cause: { code: 'NODE_KIND_WRITE_DENIED', detail } })
+    }) as MockedFunction<DeleteWorkflow>
+    const showError = vi.fn()
+    const { result } = renderHook(() => useBuilderToolbarHandlers(buildOptions({ deleteWorkflow, showError })))
+    result.current.handleDeleteWorkflow()
+    expect(showError).toHaveBeenCalledWith({
+      title: 'Failed to delete workflow',
+      description: `Failed to delete workflow "My workflow": ${detail}`,
+    })
+  })
 })
